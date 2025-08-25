@@ -1,6 +1,6 @@
 import ee
 import pandas as pd
-# A single random split 
+############################# 1. Single Random Split ###########################
 #extract pixel value for the labeled region of interest and partitioned them into training and testing data
 #This can be used if the training/reference data is balanced across class and required more fast result
 def extract_pixel_value(image, roi, class_property, scale=10, split_ratio = 0.5, tile_scale = 16):
@@ -35,7 +35,48 @@ def extract_pixel_value(image, roi, class_property, scale=10, split_ratio = 0.5,
      )
      return training_pixels, testing_pixels
 
+############################## 2. Strafied Random Split ###########################
+# Conduct stratified train and test split, ideal for proportional split of the data
+def stratified_train_test (roi, image, class_prop, scale = 10, train_ratio = 0.7, seed=0):
+    """
+    Split the region of interest using a stratified random approach, which use class label as basis for splitting
+    roi: ee.FeatureCollection (original region of interest)
+    class_prop: Class property (column) contain unique class ID
+    tran_ratio: ratio for train-test split (usually 70% for training and 50% for testing)
+    """
+    #Define the unique class id using aggregate array
+    classes = roi.aggregate_array(class_prop).distinct()
+    #split the region of interest based on the class
+    def split_class (c):
+        subset = (roi.filter(ee.Filter.eq(class_prop, c))
+                  .randomColumn('random', seed=seed))
+        train = (subset.filter(ee.Filter.lt('random', train_ratio))
+                       .map(lambda f: f.set('fraction', 'training')))
+        test = (subset.filter(ee.Filter.gte('random', train_ratio))
+                       .map(lambda f: f.set('fraction', 'testing')))
+        return train.merge(test)
+    #map the function for all the class
+    split_fc = ee.FeatureCollection(classes.map(split_class)).flatten()
+    #filter for training and testing
+    train_fc = split_fc.filter(ee.Filter.eq('fraction', 'training'))
+    test_fc = split_fc.filter(ee.Filter.eq('fraction', 'testing'))
+    print('Training pixels:', train_fc.size().getInfo())
+    print('Testing pixels:', test_fc.size().getInfo())
+    #sample the image based stratified split data
+    train_pix = image.sampleRegions(
+                        collection=train_fc,
+                        properties = [class_prop],
+                        scale = scale,
+                        tileScale = 16)
+    test_pix = image.sampleRegions(
+                        collection = test_fc,
+                        properties = [class_prop],
+                        scale = scale,
+                        tileScale = 16
+    )
+    return train_pix, test_pix
 
+############################# 3. Stratified K-fold Split ###########################
 # the strafied kfold cross validation split for more robust partitioning between training and validation data.
 # Ideal for imbalance dataset. 
 def stratified_kfold(samples, class_property, k=5, seed=0):
@@ -95,7 +136,9 @@ def stratified_kfold(samples, class_property, k=5, seed=0):
 
     folds = thresholds.map(make_fold)
     return ee.FeatureCollection(folds)
-
+# Random Forest tuning with stratified kfold sample (tailored with probability classification). 
+# This process required significant computation time, used with caution
+# ############################# 4. Hyperparameter optimization utilizing k-fold split data ###########################
 def rf_tuning_withkfold(reference_fold, image, class_prop,  
                          n_tree_list, v_split_list, leaf_pop_list, scale = 10, tile_scale = 16):
     """
@@ -145,7 +188,7 @@ def rf_tuning_withkfold(reference_fold, image, class_prop,
                             tileScale = tile_scale
                         )
                         test_pixels = image.sampleRegions(
-                            collection = train_binary,
+                            collection = testing_binary,
                             properties = ['label'],
                             scale = scale,
                             tileScale = tile_scale
@@ -190,3 +233,131 @@ def rf_tuning_withkfold(reference_fold, image, class_prop,
     result_pd_sorted = result_pd.sort_values(by='Average Validation Accuracy', ascending=False).reset_index(drop=True)
     print("Best parameters:\n", result_pd_sorted.iloc[0])            
     return result_pd_sorted
+
+############################# 5. Hyperparameter Optimization using stratified random split ###########################
+#Function for grid search parameter optimization but tailored with probability classification framework
+def grid_search_tune(train, test, image, class_property, n_tree_list, var_split_list, min_leaf_pop_list, seed = 13):
+     """
+     Perform manual testing to find a set of parameters that yielded highest accuracy for Random Forest Classifier.
+     Three main parameters were tested, namely Number of trees (n_tree), number of variable selected at split (var_split),
+     and minimum popoulation to split a node (min_leaf_pop)
+     Additional parameters for the function:
+         train: Training pixels
+         test: Testing pixels
+         band_names: band names of remote sensing imagery
+         class_property: distinct labels in the training and testing data
+     """
+    #create an empty list to store all of the result
+     result = []
+     #get unique class ID
+     class_list = train.aggregate_array(class_property).distinct().map(lambda x: ee.Number(x).int())
+     #create a loop exploring all possible combination of parameter
+     for n_tree in n_tree_list:
+         for var_split in var_split_list:
+             for min_leaf_pop in min_leaf_pop_list: 
+                 try:
+                     def per_class(class_id):
+                         class_id = ee.Number(class_id)
+                         binary_fc = train.map(lambda ft: ft.set(
+                             'binary', ee.Number(ee.Algorithms.If(ee.Number(ft.get(class_property)).eq(class_id), 1, 0
+                                                                  ))
+                         ))
+                         clf = (ee.Classifier.smileRandomForest(
+                                numberOfTrees = n_tree,
+                                variablesPerSplit = var_split,
+                                minLeafPopulation = min_leaf_pop,
+                                seed = seed)
+                                .setOutputMode('PROBABILITY'))
+                         model = clf.train(
+                             features = binary_fc,
+                             classProperty = 'binary',
+                             inputProperties = image.bandNames()
+                         )
+                         test_classified = test.classify(model)
+
+                        # Extract labels and probs
+                        # y_true = binary (0/1), y_pred = prob (0–1)
+                         y_true =  test_classified.aggregate_array('binary')
+                         y_pred =  test_classified.aggregate_array('classification')
+                         paired = y_true.zip(y_pred).map(
+                                    lambda xy: ee.Dictionary({
+                                        'y': ee.List(xy).get(0),
+                                        'p': ee.List(xy).get(1)
+                                    }))
+                         # function to calculate log loss(need clarification)
+                         def loss_fn(el):
+                                el = ee.Dictionary(el)
+                                y = ee.Number(el.get('y'))
+                                p = ee.Number(el.get('p'))
+                                return y.multiply(p.log()).add(
+                                    ee.Number(1).subtract(y).multiply((ee.Number(1).subtract(p)).log())
+                                ).multiply(-1)
+                         #return log loss for each class
+                         log_losses = paired.map(loss_fn)
+                         avg_loss = ee.Number(log_losses.reduce(ee.Reducer.mean()))
+                         return avg_loss
+                     #mapped the log loss for all class
+                     loss_list = class_list.map(per_class)
+                     avg_loss_all = ee.Number(ee.List(loss_list).reduce(ee.Reducer.mean()))
+                     #append the results of the tuning
+                     result.append({
+                                'Number of Trees': n_tree,
+                                'Variable Per Split': var_split,
+                                'Minimum Leaf Populaton': min_leaf_pop,
+                                'Average Cross Entropy Loss': avg_loss_all.getInfo()
+                    })
+                     #convert into panda dataframe for printing
+                     result_pd = pd.DataFrame(result)
+                     result_pd_sorted = result_pd.sort_values(by='Average Cross Entropy Loss', ascending=False).reset_index(drop=True)
+                     print("Best parameters:\n", result_pd_sorted.iloc[0])     
+                    # Print this message if failed
+                 except Exception as e:
+                     print(f"Failed for Trees={n_tree}, Split={var_split}, Leaf={min_leaf_pop}")
+                     print(e)
+     return result
+############################# 6. Hyperparameter Optimization For Hard Classification utilizing random split ###########################                 
+#Conduct grid search tuning for random forest hard classification
+def rf_tuning(train, test, band_names, class_property, n_tree_list, var_split_list, min_leaf_pop_list):
+     """
+     Perform manual testing to find a set of parameters that yielded highest accuracy for Random Forest Classifier.
+     Two main parameters were tested, namely Number of trees (n_tree), and number of variable selected at split (var_split)
+     Additional parameters for the function:
+         train: Training pixels
+         test: Testing pixels
+         band_names: band names of remote sensing imagery
+         class_property: distinct labels in the training and testing data
+     """
+     result = [] #initialize empty dictionary for storing parameters and accuracy score
+     #manually test the classifiers, while looping through the parameters set
+     for n_tree in n_tree_list:
+          for var_split in var_split_list:
+               for min_leaf_pop in min_leaf_pop_list:
+                  try:
+                    #initialize the random forest classifer
+                    clf = ee.Classifier.smileRandomForest(
+                         numberOfTrees=n_tree,
+                         variablesPerSplit=var_split,
+                         minLeafPopulation = min_leaf_pop,
+                         seed=0
+                    ).train(
+                        features=train,
+                        classProperty=class_property,
+                        inputProperties=band_names
+                    )
+                     #Used partitioned test data, to evaluate the trained model
+                    classified_test = test.classify(clf)
+                    #test using error matrix
+                    error_matrix = classified_test.errorMatrix(class_property, 'classification')
+                    #append the result of the test
+                    accuracy = error_matrix.accuracy().getInfo()
+                    result.append({
+                        'numberOfTrees': n_tree,
+                        'variablesPerSplit': var_split,
+                        'MinimumleafPopulation0':min_leaf_pop,
+                        'accuracy': accuracy
+                    })
+                    #print the message if error occur
+                  except Exception as e:
+                    print(f"Failed for Trees={n_tree}, Variable Split={var_split}, mininum leaf population = {min_leaf_pop}")
+                    print(e)
+     return result
