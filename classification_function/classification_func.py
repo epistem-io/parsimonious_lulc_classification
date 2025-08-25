@@ -1,4 +1,5 @@
 import ee
+import pandas as pd
 # A single random split 
 #extract pixel value for the labeled region of interest and partitioned them into training and testing data
 #This can be used if the training/reference data is balanced across class and required more fast result
@@ -95,8 +96,8 @@ def stratified_kfold(samples, class_property, k=5, seed=0):
     folds = thresholds.map(make_fold)
     return ee.FeatureCollection(folds)
 
-def rf_tuning_withkfold(reference_fold, image, class_prop, 
-                         n_tree_list, v_split_list, leaf_pop_list):
+def rf_tuning_withkfold(reference_fold, image, class_prop,  
+                         n_tree_list, v_split_list, leaf_pop_list, scale = 10, tile_scale = 16):
     """
     Perform parameter optimization for random forest One-vs-rest classification
     with stratified k-fold input data
@@ -107,11 +108,16 @@ def rf_tuning_withkfold(reference_fold, image, class_prop,
         leaf_pop: list of int, minimum leaf population to test
     return list of dict with parameters and average accuracy
     """    
-    k = reference_fold.size().get.Info()
+    #define and set the previous fold result
+    k = reference_fold.size().getInfo()
     fold_list = reference_fold.toList(k)
+    
     #get the list of unique class id
-    classes = ee.FeatureCollection(fold_list.get(0)).aggregate_array('training').distinct().getInfo()
+    first_fold = ee.Feature(fold_list.get(0))
+    training_fc0 = ee.FeatureCollection(first_fold.get('training'))
+    classes = training_fc0.aggregate_array(class_prop).distinct().getInfo()
     result = []
+    #Create a gridsearch tuning by manually looped through the parameter space
     for n_tree in n_tree_list:
         for var_split in v_split_list:
             for min_leaf_pop in leaf_pop_list:
@@ -119,7 +125,7 @@ def rf_tuning_withkfold(reference_fold, image, class_prop,
                 for i in range(k):
                     fold = ee.Feature(fold_list.get(i))
 
-                    training_fc = ee.FeatureCOllection(fold.get('training'))
+                    training_fc = ee.FeatureCollection(fold.get('training'))
                     testing_fc = ee.FeatureCollection(fold.get('testing'))
 
                     class_acc = []
@@ -131,28 +137,56 @@ def rf_tuning_withkfold(reference_fold, image, class_prop,
                         testing_binary = testing_fc.map(
                             lambda f: f.set('label', ee.Number(f.get(class_prop)).eq(c))
                         )
+                        #sample the image 
+                        train_pixels = image.sampleRegions(
+                            collection = train_binary,
+                            properties = ['label'],
+                            scale = scale,
+                            tileScale = tile_scale
+                        )
+                        test_pixels = image.sampleRegions(
+                            collection = train_binary,
+                            properties = ['label'],
+                            scale = scale,
+                            tileScale = tile_scale
+                            )
                         try:
-                            #classiifer
+                            #classiifer set to probability for binary one vs rest classification
                             clf = ee.Classifier.smileRandomForest(
                                 numberOfTrees = n_tree,
                                 variablesPerSplit = var_split,
                                 minLeafPopulation=min_leaf_pop,
                                 seed=0
                             ).setOutputMode('PROBABILITY').train(
-                                features=train_binary,
+                                features=train_pixels,
                                 classProperty = 'label',
                                 inputProperties = image.bandNames()
                             )
+                            #function to evaluate the model
+                            classified_val = test_pixels.classify(clf)
+                            model_val = classified_val.errorMatrix('label', 'classification')
+                            class_acc.append(model_val.accuracy().getInfo())
+
                         except Exception as e:
                             print(f"faild for fold {i}, class {c}")
                             print(e)
-                    fold_acc_list.append(sum(class_acc)/len(class_acc))
-                avg_acc = sum(fold_acc_list)/len(fold_acc_list)
-
-                result.append({
-                    'Number of Trees': n_tree,
-                    'variable per split': var_split,
-                    'min leaf population': min_leaf_pop,
-                    'Average Validation Accuracy': avg_acc
-                })
-    return result
+                    
+                    if class_acc: 
+                        fold_acc_list.append(sum(class_acc)/len(class_acc))
+                    else: 
+                        print(f"[WARNING] No valid accuracy scores for fold {i}. Skipping this fold.")
+                    
+                    if fold_acc_list:
+                        avg_acc = sum(fold_acc_list)/len(fold_acc_list)
+                    #Put the result into a list
+                        result.append({
+                            'Number of Trees': n_tree,
+                            'variable per split': var_split,
+                            'min leaf population': min_leaf_pop,
+                            'Average Validation Accuracy': avg_acc
+                        })
+    
+    result_pd = pd.DataFrame(result)
+    result_pd_sorted = result_pd.sort_values(by='Average Validation Accuracy', ascending=False).reset_index(drop=True)
+    print("Best parameters:\n", result_pd_sorted.iloc[0])            
+    return result_pd_sorted
